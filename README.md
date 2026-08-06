@@ -1,0 +1,1 @@
+# zeadx-ping-key
