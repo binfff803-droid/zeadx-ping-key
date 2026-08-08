@@ -1,0 +1,993 @@
+from flask import Flask, request, jsonify, redirect, session
+from flask_cors import CORS
+import json
+import os
+import random
+import string
+import time
+import requests
+from datetime import datetime
+from urllib.parse import quote
+
+app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY", "zeadx-ping-key-secret-2026-doi-neu-can")
+CORS(app)
+
+# QUAN TRỌNG: repo GitHub của bạn đang để Public, ai cũng xem được thông tin dưới đây.
+# Nên đổi tài khoản/mật khẩu định kỳ, hoặc chuyển repo sang Private nếu có thể.
+ADMIN_USERNAME = "Zeadxvnstore"
+ADMIN_PASSWORD = "zeadxvn10101"
+
+KEY_FILE = "keys.json"
+
+def login_required(f):
+    from functools import wraps
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if not session.get("is_admin"):
+            return jsonify({"error": "Chưa đăng nhập"}), 401
+        return f(*args, **kwargs)
+    return wrapper
+DAILY_LIMIT = 500
+LINK4M_TOKEN = "69902dcc482df052bb6c2347"
+LINK4M_API = "https://link4m.co/api-shorten/v2"
+# QUAN TRỌNG: Link4m chỉ chấp nhận rút gọn các URL truy cập công khai được.
+# Nếu để trống, app sẽ tự lấy host từ request (vd: http://127.0.0.1:5005) —
+# nhưng địa chỉ này KHÔNG hoạt động với Link4m vì nó là local/private.
+# Hãy chạy ngrok (hoặc cloudflared) để có domain public, ví dụ:
+#   ngrok http 5005
+# rồi dán URL https://xxxx.ngrok-free.app vào đây (không có dấu / ở cuối).
+PUBLIC_BASE_URL = ""  # Để trống khi deploy lên Render — sẽ tự lấy domain Render.
+
+def load_keys():
+    if os.path.exists(KEY_FILE):
+        with open(KEY_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return []
+
+def save_keys(keys):
+    with open(KEY_FILE, "w", encoding="utf-8") as f:
+        json.dump(keys, f, indent=2, ensure_ascii=False)
+
+def gen_key_code():
+    def seg():
+        return ''.join(random.choices(string.ascii_uppercase + string.digits, k=4))
+    return f"ZEADX-{seg()}-{seg()}-{seg()}"
+
+def count_created_today(keys):
+    today = datetime.now().date()
+    cnt = 0
+    for k in keys:
+        created = datetime.fromtimestamp(k["created_at"] / 1000).date()
+        if created == today:
+            cnt += 1
+    return cnt
+
+def create_new_key(duration_type):
+    keys = load_keys()
+    if count_created_today(keys) >= DAILY_LIMIT:
+        return None, "Đã đạt giới hạn 100 key/ngày"
+    duration_map = {
+        "12h": 12 * 60 * 60 * 1000,
+        "24h": 24 * 60 * 60 * 1000,
+        "1d": 24 * 60 * 60 * 1000,
+        "3d": 3 * 24 * 60 * 60 * 1000,
+        "7d": 7 * 24 * 60 * 60 * 1000,
+        "forever": None
+    }
+    ms = duration_map.get(duration_type)
+    now = time.time() * 1000
+    expires_at = now + ms if ms is not None else None
+    new_key = {
+        "id": int(time.time() * 1000) + random.randint(1, 10000),
+        "code": gen_key_code(),
+        "duration": duration_type,
+        "created_at": now,
+        "expires_at": expires_at,
+        "used": False
+    }
+    keys.insert(0, new_key)
+    save_keys(keys)
+    return new_key, None
+
+def shorten_url(long_url):
+    """Gọi API Link4m để rút gọn URL, trả về short URL hoặc None nếu lỗi"""
+    try:
+        params = {
+            "api": LINK4M_TOKEN,
+            "url": long_url
+        }
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "application/json"
+        }
+        resp = requests.get(LINK4M_API, params=params, headers=headers, timeout=10, allow_redirects=False)
+        if resp.status_code in (301, 302, 303, 307, 308):
+            print("Link4m redirect (thường do URL đích không public/không hợp lệ). "
+                  "Location:", resp.headers.get("Location"))
+            return None
+        try:
+            data = resp.json()
+        except ValueError:
+            print("Link4m không trả JSON. HTTP status:", resp.status_code)
+            print("Nội dung trả về (300 ký tự đầu):", resp.text[:300])
+            return None
+        if data.get("status") == "success":
+            return data.get("shortenedUrl")
+        else:
+            print("Link4m trả lỗi:", data.get("message", data))
+            return None
+    except Exception as e:
+        print("Lỗi khi gọi Link4m:", e)
+        return None
+
+# ---- Route chuyển hướng trung gian cho 24H ----
+@app.route("/redirect/<key>")
+def redirect_link(key):
+    link2 = request.args.get("to")
+    if link2:
+        return redirect(link2)
+    else:
+        return "Link không hợp lệ hoặc đã hết hạn", 404
+
+# ---- Giao diện chính ----
+@app.route("/")
+def index():
+    return '''<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Zeadx Ping — Trang Lấy Key</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@500;600;700&family=Inter:wght@400;500;600;700&family=Orbitron:wght@700;800;900&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg-0:#020509;
+    --bg-1:#040c18;
+    --bg-2:#071628;
+    --navy:#0a1f38;
+    --ocean:#0ea5e9;
+    --ocean-2:#38bdf8;
+    --ocean-deep:#0369a1;
+    --ice:#e6f6ff;
+    --white:#f7fbff;
+    --line:rgba(56,189,248,0.18);
+    --glass:rgba(10,25,45,0.55);
+  }
+  *{margin:0;padding:0;box-sizing:border-box;}
+  html,body{height:100%;}
+  body{
+    font-family:'Inter',sans-serif;
+    background:
+      radial-gradient(ellipse 900px 500px at 50% -10%, rgba(14,165,233,0.20), transparent 60%),
+      radial-gradient(ellipse 700px 600px at 90% 100%, rgba(3,105,161,0.25), transparent 55%),
+      linear-gradient(180deg, var(--bg-0) 0%, var(--bg-1) 45%, var(--bg-2) 100%);
+    color:var(--ice);
+    min-height:100vh;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    overflow-x:hidden;
+    position:relative;
+    padding:40px 20px;
+  }
+
+  .sonar-field{
+    position:fixed;inset:0;display:flex;align-items:center;justify-content:center;
+    pointer-events:none;z-index:0;opacity:0.9;
+  }
+  .sonar-ring{
+    position:absolute;border:1px solid rgba(56,189,248,0.35);border-radius:50%;
+    animation:ping-out 4s cubic-bezier(0.2,0.6,0.4,1) infinite;
+  }
+  .sonar-ring:nth-child(1){width:120px;height:120px;animation-delay:0s;}
+  .sonar-ring:nth-child(2){width:120px;height:120px;animation-delay:1.3s;}
+  .sonar-ring:nth-child(3){width:120px;height:120px;animation-delay:2.6s;}
+  @keyframes ping-out{
+    0%{width:60px;height:60px;opacity:0.9;border-color:rgba(125,211,252,0.7);}
+    100%{width:1400px;height:1400px;opacity:0;border-color:rgba(56,189,248,0);}
+  }
+
+  .grid-overlay{
+    position:fixed;inset:0;
+    background-image:linear-gradient(var(--line) 1px, transparent 1px), linear-gradient(90deg, var(--line) 1px, transparent 1px);
+    background-size:48px 48px;
+    mask-image:radial-gradient(ellipse 800px 500px at 50% 30%, black, transparent 75%);
+    opacity:0.35;z-index:0;
+  }
+
+  .noise{
+    position:fixed;inset:0;z-index:0;pointer-events:none;opacity:0.03;
+    background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='100' height='100'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2'/%3E%3C/filter%3E%3Crect width='100' height='100' filter='url(%23n)'/%3E%3C/svg%3E");
+  }
+
+  .wrap{position:relative;z-index:2;width:100%;max-width:460px;}
+
+  .brand{text-align:center;margin-bottom:28px;}
+  .brand-mark{
+    display:inline-flex;align-items:center;gap:10px;padding:6px 16px;
+    border:1px solid var(--line);border-radius:999px;background:rgba(14,165,233,0.06);
+    font-family:'Rajdhani',sans-serif;font-size:12px;letter-spacing:0.28em;text-transform:uppercase;
+    color:var(--ocean-2);margin-bottom:22px;
+  }
+  .brand-mark .dot{
+    width:7px;height:7px;border-radius:50%;background:#4ade80;
+    box-shadow:0 0 8px #4ade80, 0 0 16px #4ade80;animation:blink 1.8s ease-in-out infinite;
+  }
+  @keyframes blink{0%,100%{opacity:1;}50%{opacity:0.35;}}
+
+  h1{
+    font-family:'Orbitron',sans-serif;font-weight:900;font-size:40px;letter-spacing:0.02em;line-height:1;
+    background:linear-gradient(180deg,#ffffff 10%, #bfe9ff 55%, var(--ocean-2) 100%);
+    -webkit-background-clip:text;background-clip:text;color:transparent;
+    text-shadow:0 0 40px rgba(56,189,248,0.25);
+  }
+  h1 span{
+    display:block;font-family:'Rajdhani',sans-serif;font-weight:600;font-size:14px;letter-spacing:0.35em;
+    text-transform:uppercase;color:rgba(230,246,255,0.55);-webkit-text-fill-color:rgba(230,246,255,0.55);margin-top:10px;
+  }
+
+  .card{
+    position:relative;margin-top:32px;
+    background:linear-gradient(180deg, rgba(12,30,52,0.75), rgba(4,12,24,0.85));
+    backdrop-filter:blur(18px);border:1px solid var(--line);border-radius:6px;padding:34px 30px 30px;
+    box-shadow:0 0 0 1px rgba(56,189,248,0.05), 0 30px 60px -20px rgba(0,0,0,0.7), 0 0 80px -30px rgba(14,165,233,0.4);
+  }
+  .corner{position:absolute;width:16px;height:16px;border:2px solid var(--ocean-2);opacity:0.9;}
+  .corner.tl{top:-1px;left:-1px;border-right:none;border-bottom:none;border-radius:6px 0 0 0;}
+  .corner.br{bottom:-1px;right:-1px;border-left:none;border-top:none;border-radius:0 0 6px 0;}
+
+  .card-label{
+    font-family:'Rajdhani',sans-serif;font-size:13px;font-weight:600;letter-spacing:0.22em;text-transform:uppercase;
+    color:rgba(230,246,255,0.45);margin-bottom:16px;display:flex;align-items:center;gap:10px;
+  }
+  .card-label::after{content:"";flex:1;height:1px;background:linear-gradient(90deg, rgba(56,189,248,0.3), transparent);}
+
+  .options{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:22px;}
+  .opt{
+    position:relative;cursor:pointer;border-radius:4px;border:1px solid rgba(56,189,248,0.2);
+    background:rgba(4,12,24,0.6);padding:18px 14px 16px;text-align:left;
+    transition:border-color .2s ease, background .2s ease, transform .15s ease;-webkit-tap-highlight-color:transparent;
+  }
+  .opt:hover{border-color:rgba(56,189,248,0.5);transform:translateY(-2px);}
+  .opt input{position:absolute;opacity:0;pointer-events:none;}
+  .opt-time{font-family:'Orbitron',sans-serif;font-weight:800;font-size:22px;color:var(--white);display:flex;align-items:baseline;gap:4px;}
+  .opt-time small{font-family:'Rajdhani',sans-serif;font-size:12px;font-weight:600;color:rgba(230,246,255,0.5);}
+  .opt-desc{margin-top:6px;font-family:'Rajdhani',sans-serif;font-size:12px;color:rgba(230,246,255,0.45);letter-spacing:0.03em;}
+  .opt-radio{position:absolute;top:14px;right:14px;width:16px;height:16px;border-radius:50%;border:1.5px solid rgba(56,189,248,0.4);}
+  .opt-radio::after{content:"";position:absolute;inset:3px;border-radius:50%;background:var(--ocean-2);transform:scale(0);transition:transform .15s ease;}
+  .opt.active{
+    border-color:var(--ocean-2);background:linear-gradient(135deg, rgba(14,165,233,0.14), rgba(4,12,24,0.6));
+    box-shadow:0 0 0 1px rgba(56,189,248,0.3), 0 0 24px -6px rgba(56,189,248,0.5);
+  }
+  .opt.active .opt-radio::after{transform:scale(1);}
+  .opt.active .opt-time{color:var(--ocean-2);}
+
+  .get-key{
+    width:100%;position:relative;overflow:hidden;border:none;border-radius:12px;padding:16px;cursor:pointer;
+    font-family:'Rajdhani',sans-serif;font-weight:700;font-size:16px;letter-spacing:0.18em;text-transform:uppercase;
+    color:#031018;background:linear-gradient(135deg, #7dd3fc, var(--ocean) 55%, var(--ocean-deep));
+    box-shadow:0 8px 24px -8px rgba(14,165,233,0.7);transition:transform .12s ease, box-shadow .2s ease;
+  }
+  .get-key:hover{transform:translateY(-1px);box-shadow:0 12px 30px -8px rgba(56,189,248,0.85);}
+  .get-key:active{transform:translateY(0px) scale(0.99);}
+  .get-key .shine{
+    position:absolute;top:0;bottom:0;left:-60%;width:40%;
+    background:linear-gradient(120deg, transparent, rgba(255,255,255,0.55), transparent);
+    transform:skewX(-20deg);animation:shine 3.2s ease-in-out infinite;
+  }
+  @keyframes shine{0%{left:-60%;}55%{left:130%;}100%{left:130%;}}
+  .get-key.loading{pointer-events:none;opacity:0.85;}
+  .get-key .btn-text{position:relative;z-index:2;display:flex;align-items:center;justify-content:center;gap:10px;}
+  .spinner{
+    width:15px;height:15px;border-radius:50%;border:2px solid rgba(3,16,24,0.25);
+    border-top-color:#031018;animation:spin .7s linear infinite;display:none;
+  }
+  .get-key.loading .spinner{display:inline-block;}
+  @keyframes spin{to{transform:rotate(360deg);}}
+
+  .err-msg{margin-top:16px;text-align:center;font-family:'Rajdhani',sans-serif;font-size:13px;font-weight:600;color:#f87171;display:none;}
+  .err-msg.show{display:block;}
+
+  .foot{margin-top:22px;text-align:center;font-family:'Rajdhani',sans-serif;font-size:11.5px;letter-spacing:0.08em;color:rgba(230,246,255,0.35);}
+  .foot b{color:rgba(230,246,255,0.55);}
+
+  @media (max-width:420px){ h1{font-size:32px;} .card{padding:26px 20px 22px;} }
+
+  .menu-btn{
+    position:fixed;top:20px;left:20px;z-index:20;width:44px;height:44px;
+    display:flex;flex-direction:column;align-items:center;justify-content:center;gap:5px;
+    background:rgba(10,25,45,0.6);backdrop-filter:blur(10px);border:1px solid var(--line);
+    border-radius:10px;cursor:pointer;-webkit-tap-highlight-color:transparent;
+  }
+  .menu-btn span{width:20px;height:2px;background:var(--ocean-2);border-radius:2px;transition:transform .25s ease, opacity .2s ease;}
+  .menu-btn.open span:nth-child(1){transform:translateY(7px) rotate(45deg);}
+  .menu-btn.open span:nth-child(2){opacity:0;}
+  .menu-btn.open span:nth-child(3){transform:translateY(-7px) rotate(-45deg);}
+
+  .side-menu{
+    position:fixed;top:0;left:0;bottom:0;width:250px;
+    background:linear-gradient(180deg, rgba(4,12,24,0.97), rgba(7,22,40,0.97));
+    border-right:1px solid var(--line);z-index:19;padding:90px 24px 24px;
+    transform:translateX(-100%);transition:transform .3s ease;backdrop-filter:blur(20px);
+  }
+  .side-menu.open{transform:translateX(0);}
+  .side-menu a{
+    display:flex;align-items:center;gap:10px;font-family:'Rajdhani',sans-serif;font-weight:600;font-size:15px;
+    letter-spacing:0.08em;text-transform:uppercase;color:rgba(230,246,255,0.7);text-decoration:none;
+    padding:14px 0;border-bottom:1px solid rgba(56,189,248,0.12);transition:color .2s ease;
+  }
+  .side-menu a svg{width:16px;height:16px;flex-shrink:0;stroke:currentColor;}
+  .side-menu a:hover{color:var(--ocean-2);}
+
+  .menu-overlay{position:fixed;inset:0;background:rgba(2,5,9,0.6);z-index:18;opacity:0;pointer-events:none;transition:opacity .3s ease;}
+  .menu-overlay.open{opacity:1;pointer-events:auto;}
+
+  .music-wrap{
+    position:fixed;top:16px;right:16px;z-index:20;width:230px;max-width:44vw;
+  }
+  .music-bar{
+    width:100%;height:38px;border-radius:10px;
+    background:rgba(10,25,45,0.7);border:1px solid var(--line);backdrop-filter:blur(10px);
+    accent-color:#38bdf8;
+  }
+  .music-bar::-webkit-media-controls-panel{ background-color:rgba(10,25,45,0.9); }
+  .music-bar::-webkit-media-controls-play-button,
+  .music-bar::-webkit-media-controls-mute-button{
+    filter:invert(80%) sepia(40%) saturate(900%) hue-rotate(160deg);
+  }
+  .music-bar::-webkit-media-controls-current-time-display,
+  .music-bar::-webkit-media-controls-time-remaining-display{ color:#f7fbff; }
+  @media (max-width:420px){ .music-wrap{width:170px;top:12px;right:12px;} }
+</style>
+</head>
+<body>
+
+  <button class="menu-btn" id="menuBtn" aria-label="Mở menu">
+    <span></span><span></span><span></span>
+  </button>
+  <div class="menu-overlay" id="menuOverlay"></div>
+  <nav class="side-menu" id="sideMenu">
+    <a href="/">
+      <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12l9-9 9 9"/><path d="M9 21V12h6v9"/></svg>
+      Trang Chủ
+    </a>
+    <a href="/tim-nhac">
+      <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
+      Tìm Nhạc
+    </a>
+    <a href="/tra-cuu-key">
+      <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      Tra Cứu Key
+    </a>
+    <a href="/admin/login">
+      <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="8" r="4"></circle>
+        <path d="M4 20c0-4.4 3.6-8 8-8s8 3.6 8 8"></path>
+      </svg>
+      Admin Login
+    </a>
+  </nav>
+
+  <div class="music-wrap">
+    <audio class="music-bar" id="genSound" src="/static/key-sound.mp3" controls loop preload="auto"></audio>
+  </div>
+
+  <div class="sonar-field">
+    <div class="sonar-ring"></div>
+    <div class="sonar-ring"></div>
+    <div class="sonar-ring"></div>
+  </div>
+  <div class="grid-overlay"></div>
+  <div class="noise"></div>
+
+  <div class="wrap">
+    <div class="brand">
+      <div class="brand-mark"><span class="dot"></span> Server Online — Ổn Định</div>
+      <h1>ZEADX PING<span>Trang Lấy Key</span></h1>
+    </div>
+
+    <div class="card">
+      <div class="corner tl"></div>
+      <div class="corner br"></div>
+
+      <div class="card-label">Chọn thời hạn Key</div>
+
+      <div class="options">
+        <label class="opt active" id="opt12">
+          <input type="radio" name="duration" value="12" checked>
+          <span class="opt-radio"></span>
+          <div class="opt-time">12<small>GIỜ</small></div>
+          <div class="opt-desc">Key 12H — dùng nhanh</div>
+        </label>
+
+        <label class="opt" id="opt24">
+          <input type="radio" name="duration" value="24">
+          <span class="opt-radio"></span>
+          <div class="opt-time">24<small>GIỜ</small></div>
+          <div class="opt-desc">Key 24H — dùng cả ngày</div>
+        </label>
+      </div>
+
+      <button class="get-key" id="getKeyBtn">
+        <span class="shine"></span>
+        <span class="btn-text">
+          <span class="spinner"></span>
+          <span id="btnLabel">GET KEY</span>
+        </span>
+      </button>
+
+      <div class="err-msg" id="errMsg"></div>
+    </div>
+
+    <div class="foot">ZEADX PING © 2026 · Vui lòng không chia sẻ Key cho người khác · Hạn dùng <b id="footDuration">12 Giờ</b></div>
+  </div>
+
+<script>
+  const menuBtn = document.getElementById(\'menuBtn\');
+  const sideMenu = document.getElementById(\'sideMenu\');
+  const menuOverlay = document.getElementById(\'menuOverlay\');
+  function toggleMenu(){
+    menuBtn.classList.toggle(\'open\');
+    sideMenu.classList.toggle(\'open\');
+    menuOverlay.classList.toggle(\'open\');
+  }
+  menuBtn.addEventListener(\'click\', toggleMenu);
+  menuOverlay.addEventListener(\'click\', toggleMenu);
+
+  const opt12 = document.getElementById(\'opt12\');
+  const opt24 = document.getElementById(\'opt24\');
+  const footDuration = document.getElementById(\'footDuration\');
+  const getKeyBtn = document.getElementById(\'getKeyBtn\');
+  const btnLabel = document.getElementById(\'btnLabel\');
+  const errMsg = document.getElementById(\'errMsg\');
+  const genSound = document.getElementById(\'genSound\');
+
+  let selected = \'12\';
+
+  function selectOpt(which){
+    selected = which;
+    if(which === \'12\'){
+      opt12.classList.add(\'active\'); opt24.classList.remove(\'active\');
+      footDuration.textContent = \'12 Giờ\';
+    } else {
+      opt24.classList.add(\'active\'); opt12.classList.remove(\'active\');
+      footDuration.textContent = \'24 Giờ\';
+    }
+    errMsg.classList.remove(\'show\');
+  }
+  opt12.addEventListener(\'click\', () => selectOpt(\'12\'));
+  opt24.addEventListener(\'click\', () => selectOpt(\'24\'));
+
+  function setLoading(isLoading){
+    getKeyBtn.classList.toggle(\'loading\', isLoading);
+    btnLabel.textContent = isLoading ? \'ĐANG TẠO KEY...\' : \'GET KEY\';
+  }
+
+  getKeyBtn.addEventListener(\'click\', function(){
+    try{ genSound.currentTime = 0; genSound.play(); }catch(e){}
+    errMsg.classList.remove(\'show\');
+    setLoading(true);
+    const hours = selected === \'24\' ? \'24\' : \'12\';
+    fetch(\'/api/generate\', {
+      method: \'POST\',
+      headers: {\'Content-Type\': \'application/json\'},
+      body: JSON.stringify({hours: hours})
+    }).then(res => res.json()).then(data => {
+      if(data.error){
+        setLoading(false);
+        errMsg.textContent = data.error;
+        errMsg.classList.add(\'show\');
+        return;
+      }
+      if(data.short_url){
+        window.location.href = data.short_url;
+      } else {
+        setLoading(false);
+        errMsg.textContent = \'Không thể tạo link, vui lòng thử lại\';
+        errMsg.classList.add(\'show\');
+      }
+    }).catch(err => {
+      setLoading(false);
+      errMsg.textContent = \'Lỗi kết nối đến server: \' + err;
+      errMsg.classList.add(\'show\');
+    });
+  });
+</script>
+
+</body>
+</html>'''
+
+@app.route("/generate")
+def show_key():
+    key = request.args.get('key', 'ZEADX-XXXX-XXXX-XXXX')
+    duration = request.args.get('duration', '12H')
+    return f'''
+    <!DOCTYPE html>
+    <html lang="vi">
+    <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Zeadx Ping — Đã Tạo Key</title>
+    <style>
+      :root{{--bg-1:#150a24;--bg-2:#1c0f33;--violet:#8b5cf6;--pink:#ec4899;--card-border:rgba(139,92,246,0.25);--text-dim:#8b93a7;--green:#34d399;}}
+      *{{box-sizing:border-box;}}
+      html,body{{margin:0;padding:0;min-height:100vh;background:radial-gradient(circle at 15% 8%,#2a1550 0%,transparent 45%),radial-gradient(circle at 90% 15%,#34104f 0%,transparent 50%),radial-gradient(circle at 50% 100%,#170a2e 0%,transparent 60%),linear-gradient(180deg,var(--bg-1) 0%,var(--bg-2) 100%);font-family:'Segoe UI',sans-serif;color:#fff;display:flex;align-items:center;justify-content:center;min-height:100vh;}}
+      .card{{max-width:480px;width:100%;background:rgba(17,24,39,0.85);border:1px solid var(--card-border);border-radius:22px;padding:44px 26px;backdrop-filter:blur(8px);text-align:center;}}
+      .check-wrap{{width:96px;height:96px;margin:0 auto 24px;border-radius:50%;background:radial-gradient(circle at 50% 40%,rgba(52,211,153,0.25) 0%,transparent 70%);display:flex;align-items:center;justify-content:center;box-shadow:0 0 0 1px rgba(52,211,153,0.35),0 0 40px 6px rgba(52,211,153,0.35);}}
+      .check-wrap svg{{width:46px;height:46px;}}
+      h1{{font-size:24px;font-weight:800;background:linear-gradient(90deg,#8b5cf6,#ec4899);-webkit-background-clip:text;background-clip:text;color:transparent;}}
+      .subtitle{{color:var(--text-dim);font-size:14.5px;margin-bottom:20px;}}
+      .key-box{{background:rgba(8,12,22,0.75);border:1.5px solid rgba(139,92,246,0.4);border-radius:16px;padding:18px 16px;display:flex;align-items:center;justify-content:space-between;gap:10px;}}
+      .key-code{{font-family:'Courier New',monospace;font-size:16px;font-weight:800;color:#fff;letter-spacing:1px;word-break:break-all;text-align:left;}}
+      .copy-btn{{border:none;border-radius:11px;padding:10px 14px;font-size:12.5px;font-weight:800;color:#fff;cursor:pointer;background:linear-gradient(90deg,#8b5cf6,#ec4899);box-shadow:0 8px 20px -8px rgba(236,72,153,0.55);white-space:nowrap;}}
+      .copy-btn.copied{{background:linear-gradient(90deg,#22c55e,#34d399);}}
+      .key-info-row{{display:flex;justify-content:space-between;margin-top:16px;font-size:12px;color:var(--text-dim);}}
+      .key-info-row .val{{color:#c4b5fd;font-weight:700;}}
+      .btn-primary{{width:100%;border:none;border-radius:14px;padding:16px;font-size:15px;font-weight:800;color:#fff;cursor:pointer;margin-top:24px;background:linear-gradient(90deg,#8b5cf6,#ec4899);box-shadow:0 12px 28px -10px rgba(236,72,153,0.55);}}
+      .back-link{{margin-top:16px;font-size:12.5px;color:#8b93a7;cursor:pointer;}}
+      .back-link:hover{{color:#f0abfc;}}
+      .footer-note{{margin-top:28px;color:var(--text-dim);font-size:13.5px;}}
+      .zalo-numbers{{color:#f0abfc;font-weight:700;}}
+      .copyright{{margin-top:30px;font-size:11.5px;color:#4a5468;}}
+    </style>
+    </head>
+    <body>
+    <div class="card">
+      <div class="check-wrap"><svg viewBox="0 0 24 24" fill="none"><path d="M20 6L9 17l-5-5" stroke="#34d399" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+      <h1>Hệ Thống Đã Tạo Xong Key</h1>
+      <div class="subtitle">Key của bạn đã sẵn sàng, hãy sao chép và sử dụng ngay</div>
+      <div class="key-box">
+        <div class="key-code" id="keyCode">{key}</div>
+        <button class="copy-btn" id="copyBtn">📋 Copy</button>
+      </div>
+      <div class="key-info-row">
+        <span>Thời hạn: <span class="val">{duration}</span></span>
+        <span>Trạng thái: <span class="val" style="color:#34d399">Chưa dùng</span></span>
+      </div>
+      <button class="btn-primary" onclick="location.href='/'">TẠO KEY MỚI</button>
+      <div class="back-link" onclick="location.href='/'">← Quay lại trang lấy Key</div>
+      <div class="footer-note">Mua Key — Inbox Zalo: <span class="zalo-numbers">0961291657</span> hoặc <span class="zalo-numbers">0938738602</span></div>
+      <div class="copyright">© 2026 ZEADX PING KEY | All Rights Reserved.</div>
+    </div>
+    <script>
+      document.getElementById('copyBtn').addEventListener('click', function() {{
+        const code = document.getElementById('keyCode').textContent;
+        const btn = this;
+        if (navigator.clipboard && navigator.clipboard.writeText) {{
+          navigator.clipboard.writeText(code).then(() => {{
+            btn.textContent = '✓ Đã Copy';
+            btn.classList.add('copied');
+            setTimeout(() => {{ btn.textContent = '📋 Copy'; btn.classList.remove('copied'); }}, 1500);
+          }}).catch(() => fallbackCopy(code));
+        }} else {{
+          fallbackCopy(code);
+          btn.textContent = '✓ Đã Copy';
+          btn.classList.add('copied');
+          setTimeout(() => {{ btn.textContent = '📋 Copy'; btn.classList.remove('copied'); }}, 1500);
+        }}
+      }});
+      function fallbackCopy(text) {{
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.position='fixed'; ta.style.opacity='0';
+        document.body.appendChild(ta);
+        ta.select();
+        try{{ document.execCommand('copy'); }}catch(e){{}}
+        document.body.removeChild(ta);
+      }}
+    </script>
+    </body>
+    </html>
+    '''
+
+# ---- API tạo key và link vượt ----
+@app.route("/api/generate", methods=["POST"])
+def api_generate():
+    data = request.get_json()
+    hours = data.get("hours", "12")
+    duration_type = "12h" if hours == "12" else "24h"
+
+    # Tạo key mới
+    key_obj, err = create_new_key(duration_type)
+    if err:
+        return jsonify({"error": err}), 400
+
+    key = key_obj["code"]
+    duration = duration_type
+    # Ưu tiên dùng PUBLIC_BASE_URL (vd: domain ngrok/local tunnel) nếu đã cấu hình,
+    # nếu không thì tự lấy từ request (đúng khi deploy trên Render vì Render có domain public).
+    if PUBLIC_BASE_URL:
+        host = PUBLIC_BASE_URL.rstrip('/')
+    else:
+        host = request.host_url.rstrip('/')
+        # Render chạy sau proxy HTTPS nhưng request.host_url có thể trả về http:// —
+        # ép về https để link không bị lỗi mixed-content.
+        if host.startswith("http://") and request.headers.get("X-Forwarded-Proto") == "https":
+            host = "https://" + host[len("http://"):]
+    # URL đích: trang generate
+    target_url = f"{host}/generate?key={key}&duration={duration}"
+
+    # Rút gọn URL đích qua Link4m
+    short_url = shorten_url(target_url)
+    if not short_url:
+        return jsonify({"error": "Không thể tạo link rút gọn, vui lòng thử lại"}), 400
+
+    # Nếu là 24H, tạo thêm một link trung gian
+    if duration_type == "24h":
+        # Tạo link2 (short) trỏ đến trang generate
+        link2 = shorten_url(target_url)
+        if not link2:
+            return jsonify({"error": "Không thể tạo link thứ hai"}), 400
+        # Nhúng link2 trực tiếp vào URL redirect (không lưu RAM) để không bị mất
+        # khi server Render free tier "ngủ" (spin down) giữa lúc người dùng vượt link.
+        redirect_route = f"{host}/redirect/{key}?to={quote(link2, safe='')}"
+        link1 = shorten_url(redirect_route)
+        if not link1:
+            return jsonify({"error": "Không thể tạo link trung gian"}), 400
+        # Trả về link1 cho front-end
+        return jsonify({"short_url": link1})
+    else:
+        # 12H: trả về short_url trực tiếp
+        return jsonify({"short_url": short_url})
+
+# ---- API Admin (giữ nguyên, nay đã yêu cầu đăng nhập) ----
+@app.route("/api/admin/keys", methods=["GET"])
+@login_required
+def admin_get_keys():
+    return jsonify(load_keys())
+
+@app.route("/api/admin/create", methods=["POST"])
+@login_required
+def admin_create_key():
+    data = request.get_json()
+    duration_type = data.get("duration", "12h")
+    if duration_type not in ["12h","24h","1d","3d","7d","forever"]:
+        duration_type = "12h"
+    key_obj, err = create_new_key(duration_type)
+    if err:
+        return jsonify({"error": err}), 400
+    return jsonify(key_obj)
+
+@app.route("/api/admin/delete/<int:key_id>", methods=["DELETE"])
+@login_required
+def admin_delete_key(key_id):
+    keys = load_keys()
+    new_keys = [k for k in keys if k["id"] != key_id]
+    if len(new_keys) == len(keys):
+        return jsonify({"error": "Không tìm thấy key"}), 404
+    save_keys(new_keys)
+    return jsonify({"success": True})
+
+@app.route("/api/admin/today-count", methods=["GET"])
+def admin_today_count():
+    keys = load_keys()
+    return jsonify({"count": count_created_today(keys), "limit": DAILY_LIMIT})
+
+NAV_STYLE = '''
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@500;600;700&family=Inter:wght@400;500;600;700&family=Orbitron:wght@700;800;900&display=swap" rel="stylesheet">
+    <style>
+      :root{ --bg-0:#020509; --bg-1:#040c18; --bg-2:#071628; --ocean:#0ea5e9; --ocean-2:#38bdf8; --ocean-deep:#0369a1; --ice:#e6f6ff; --white:#f7fbff; --line:rgba(56,189,248,0.18); }
+      *{ box-sizing:border-box; }
+      html,body{ height:100%; margin:0; }
+      body{
+        font-family:'Inter',sans-serif;
+        background:
+          radial-gradient(ellipse 900px 500px at 50% -10%, rgba(14,165,233,0.20), transparent 60%),
+          radial-gradient(ellipse 700px 600px at 90% 100%, rgba(3,105,161,0.25), transparent 55%),
+          linear-gradient(180deg, var(--bg-0) 0%, var(--bg-1) 45%, var(--bg-2) 100%);
+        color:var(--ice); min-height:100vh; position:relative; overflow-x:hidden;
+      }
+      .grid-overlay{ position:fixed; inset:0; background-image:linear-gradient(var(--line) 1px, transparent 1px), linear-gradient(90deg, var(--line) 1px, transparent 1px); background-size:48px 48px; mask-image:radial-gradient(ellipse 800px 500px at 50% 30%, black, transparent 75%); opacity:0.35; z-index:0; }
+      .container{ position:relative; z-index:2; max-width:460px; margin:0 auto; padding:90px 20px 40px; text-align:center; }
+      .card{
+        position:relative; background:linear-gradient(180deg, rgba(12,30,52,0.75), rgba(4,12,24,0.85));
+        backdrop-filter:blur(18px); border:1px solid var(--line); border-radius:6px; padding:34px 30px 30px;
+        box-shadow:0 0 0 1px rgba(56,189,248,0.05), 0 30px 60px -20px rgba(0,0,0,0.7), 0 0 80px -30px rgba(14,165,233,0.4);
+      }
+      h1{ font-family:'Orbitron',sans-serif; font-weight:800; font-size:26px; letter-spacing:0.02em;
+        background:linear-gradient(180deg,#ffffff 10%, #bfe9ff 55%, var(--ocean-2) 100%);
+        -webkit-background-clip:text; background-clip:text; color:transparent; margin:0 0 12px;
+        text-shadow:0 0 40px rgba(56,189,248,0.25); }
+      .subtitle{ font-family:'Rajdhani',sans-serif; font-size:14px; color:rgba(230,246,255,0.5); margin-bottom:22px; letter-spacing:0.02em; }
+      .field{
+        width:100%; background:rgba(4,12,24,0.7); border:1px solid rgba(56,189,248,0.25); border-radius:6px;
+        padding:14px 15px; color:var(--white); font-family:'Inter',sans-serif; font-size:14.5px; margin-bottom:14px; outline:none;
+        transition:border-color .2s ease, box-shadow .2s ease;
+      }
+      .field::placeholder{ color:rgba(230,246,255,0.35); }
+      .field:focus{ border-color:var(--ocean-2); box-shadow:0 0 0 3px rgba(56,189,248,0.15); }
+      .btn-primary{
+        width:100%; border:none; border-radius:12px; padding:16px; cursor:pointer;
+        font-family:'Rajdhani',sans-serif; font-weight:700; font-size:15px; letter-spacing:0.14em; text-transform:uppercase;
+        color:#031018; background:linear-gradient(135deg, #7dd3fc, var(--ocean) 55%, var(--ocean-deep));
+        box-shadow:0 8px 24px -8px rgba(14,165,233,0.7); transition:transform .12s ease, box-shadow .2s ease;
+      }
+      .btn-primary:hover{ transform:translateY(-1px); box-shadow:0 12px 30px -8px rgba(56,189,248,0.85); }
+      .msg{ margin-top:14px; font-family:'Rajdhani',sans-serif; font-size:13.5px; font-weight:600; }
+      .msg-err{ color:#f87171; }
+      .msg-ok{ color:#4ade80; }
+      .table-wrap{ overflow-x:auto; margin-top:18px; }
+      table{ width:100%; border-collapse:collapse; font-size:13px; color:var(--ice); font-family:'Inter',sans-serif; }
+      th,td{ padding:10px 8px; text-align:left; border-bottom:1px solid rgba(56,189,248,0.15); }
+      th{ color:rgba(230,246,255,0.5); font-weight:700; font-family:'Rajdhani',sans-serif; letter-spacing:0.05em; text-transform:uppercase; font-size:12px; }
+      .del-btn{ background:rgba(248,113,113,0.12); color:#f87171; border:1px solid rgba(248,113,113,0.4); border-radius:6px; padding:6px 10px; font-size:12px; cursor:pointer; font-family:'Rajdhani',sans-serif; font-weight:700; }
+      .admin-menu{ display:flex; flex-wrap:wrap; gap:10px; margin-top:20px; }
+      .admin-menu .item{ flex:1 1 45%; background:rgba(4,12,24,0.6); border:1px solid rgba(56,189,248,0.2); border-radius:6px; padding:14px 10px; font-family:'Rajdhani',sans-serif; font-size:12.5px; letter-spacing:0.03em; color:rgba(230,246,255,0.7); font-weight:700; }
+      .soon{ opacity:0.5; }
+    </style>
+'''
+NAV_HTML = '''
+    <button class="menu-btn" id="hamburgerBtn" aria-label="Menu">
+      <span></span><span></span><span></span>
+    </button>
+    <div class="menu-overlay" id="menuOverlay"></div>
+    <nav class="side-menu" id="navMenu">
+      <a href="/">
+        <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12l9-9 9 9"/><path d="M9 21V12h6v9"/></svg>
+        Trang Chủ
+      </a>
+      <a href="/tim-nhac">
+        <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
+        Tìm Nhạc
+      </a>
+      <a href="/">
+        <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="10" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+        Lấy Key
+      </a>
+      <a href="/tra-cuu-key">
+        <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+        Tra Cứu Key
+      </a>
+      <a href="/admin/login">
+        <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="4"/><path d="M4 20c0-4.4 3.6-8 8-8s8 3.6 8 8"/></svg>
+        Admin Login
+      </a>
+    </nav>
+    <style>
+      .menu-btn{ position:fixed; top:20px; left:20px; z-index:20; width:44px; height:44px; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:5px; background:rgba(10,25,45,0.6); backdrop-filter:blur(10px); border:1px solid var(--line); border-radius:10px; cursor:pointer; -webkit-tap-highlight-color:transparent; }
+      .menu-btn span{ width:20px; height:2px; background:var(--ocean-2); border-radius:2px; transition:transform .25s ease, opacity .2s ease; }
+      .menu-btn.open span:nth-child(1){ transform:translateY(7px) rotate(45deg); }
+      .menu-btn.open span:nth-child(2){ opacity:0; }
+      .menu-btn.open span:nth-child(3){ transform:translateY(-7px) rotate(-45deg); }
+      .side-menu{ position:fixed; top:0; left:0; bottom:0; width:250px; background:linear-gradient(180deg, rgba(4,12,24,0.97), rgba(7,22,40,0.97)); border-right:1px solid var(--line); z-index:19; padding:90px 24px 24px; transform:translateX(-100%); transition:transform .3s ease; backdrop-filter:blur(20px); }
+      .side-menu.open{ transform:translateX(0); }
+      .side-menu a{ display:flex; align-items:center; gap:10px; font-family:'Rajdhani',sans-serif; font-weight:600; font-size:15px; letter-spacing:0.08em; text-transform:uppercase; color:rgba(230,246,255,0.7); text-decoration:none; padding:14px 0; border-bottom:1px solid rgba(56,189,248,0.12); transition:color .2s ease; }
+      .side-menu a svg{ width:16px; height:16px; flex-shrink:0; stroke:currentColor; }
+      .side-menu a:hover{ color:var(--ocean-2); }
+      .menu-overlay{ position:fixed; inset:0; background:rgba(2,5,9,0.6); z-index:18; opacity:0; pointer-events:none; transition:opacity .3s ease; }
+      .menu-overlay.open{ opacity:1; pointer-events:auto; }
+    </style>
+    <div class="grid-overlay"></div>
+    <script>
+      (function(){ var btn=document.getElementById('hamburgerBtn'); var menu=document.getElementById('navMenu'); var overlay=document.getElementById('menuOverlay'); if(!btn||!menu) return; function toggle(){ btn.classList.toggle('open'); menu.classList.toggle('open'); overlay.classList.toggle('open'); } btn.addEventListener('click', toggle); overlay.addEventListener('click', toggle); })();
+    </script>
+'''
+BASE_CARD_STYLE = ''
+
+@app.route("/tim-nhac")
+def tim_nhac():
+    return f'''<!DOCTYPE html><html lang="vi"><head><meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Zeadx Ping — Tìm Nhạc</title>
+    {NAV_STYLE}</head><body>
+    {NAV_HTML}
+    <div class="container"><div class="card">
+      <h1>Tìm Nhạc</h1>
+      <div class="subtitle">Tính năng này đang được phát triển, sẽ sớm ra mắt.</div>
+    </div></div></body></html>'''
+
+@app.route("/tra-cuu-key")
+def tra_cuu_key():
+    return f'''<!DOCTYPE html><html lang="vi"><head><meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Zeadx Ping — Tra Cứu Key</title>
+    {NAV_STYLE}</head><body>
+    {NAV_HTML}
+    <div class="container"><div class="card">
+      <h1>Tra Cứu Key</h1>
+      <div class="subtitle">Nhập mã key để kiểm tra tình trạng</div>
+      <input class="field" id="keyInput" placeholder="Nhập key, vd: ZEADX-XXXX-XXXX-XXXX" autocapitalize="characters">
+      <button class="btn-primary" onclick="lookupKey()">Kiểm tra</button>
+      <div id="result" class="msg"></div>
+    </div></div>
+    <script>
+      async function lookupKey(){{
+        var k = document.getElementById('keyInput').value.trim().toUpperCase();
+        var result = document.getElementById('result');
+        if(!k){{ result.className='msg msg-err'; result.textContent='Vui lòng nhập key'; return; }}
+        result.className='msg'; result.textContent='Đang kiểm tra...';
+        try{{
+          var res = await fetch('/api/lookup-key?key=' + encodeURIComponent(k));
+          var data = await res.json();
+          if(data.found){{
+            result.className='msg msg-ok';
+            result.textContent = 'Key hợp lệ — Loại: ' + data.duration + (data.expired ? ' (ĐÃ HẾT HẠN)' : ' (còn hiệu lực)');
+          }} else {{
+            result.className='msg msg-err'; result.textContent='Không tìm thấy key này.';
+          }}
+        }}catch(e){{ result.className='msg msg-err'; result.textContent='Lỗi kết nối.'; }}
+      }}
+    </script>
+    </body></html>'''
+
+@app.route("/api/lookup-key")
+def api_lookup_key():
+    k = request.args.get("key", "").strip().upper()
+    keys = load_keys()
+    for item in keys:
+        if item.get("code", "").upper() == k:
+            duration = item.get("duration")
+            created_at = item.get("created_at", 0)
+            duration_map = {"12h": 12*60*60*1000, "24h": 24*60*60*1000, "1d": 24*60*60*1000,
+                             "3d": 3*24*60*60*1000, "7d": 7*24*60*60*1000, "forever": None}
+            ms = duration_map.get(duration)
+            expired = False
+            if ms is not None:
+                expired = (time.time()*1000 - created_at) > ms
+            return jsonify({"found": True, "duration": duration, "expired": expired})
+    return jsonify({"found": False})
+
+@app.route("/admin/login", methods=["GET", "POST"])
+def admin_login():
+    error = ""
+    if request.method == "POST":
+        u = request.form.get("username", "")
+        p = request.form.get("password", "")
+        if u == ADMIN_USERNAME and p == ADMIN_PASSWORD:
+            session["is_admin"] = True
+            return redirect("/admin")
+        error = "Sai tài khoản hoặc mật khẩu"
+    return f'''<!DOCTYPE html><html lang="vi"><head><meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Zeadx Ping — Admin Login</title>
+    {NAV_STYLE}</head><body>
+    {NAV_HTML}
+    <div class="container"><div class="card">
+      <h1>Admin Login</h1>
+      <div class="subtitle">Đăng nhập để quản lý hệ thống</div>
+      <form method="POST">
+        <input class="field" name="username" placeholder="Tài khoản" required>
+        <input class="field" name="password" type="password" placeholder="Mật khẩu" required>
+        <button class="btn-primary" type="submit">Đăng nhập</button>
+      </form>
+      {'<div class="msg msg-err">' + error + '</div>' if error else ''}
+    </div></div></body></html>'''
+
+@app.route("/admin/logout", methods=["POST"])
+def admin_logout():
+    session.pop("is_admin", None)
+    return redirect("/admin/login")
+
+@app.route("/admin")
+def admin_dashboard():
+    if not session.get("is_admin"):
+        return redirect("/admin/login")
+    return f'''<!DOCTYPE html><html lang="vi"><head><meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Zeadx Ping — Admin Panel</title>
+    {NAV_STYLE}
+    <style>
+      .admin-list{{ text-align:left; margin-top:8px; }}
+      .admin-row{{ display:flex; align-items:center; gap:12px; padding:13px 4px; border-bottom:1px solid rgba(56,189,248,0.12); background:none; border-left:none; border-right:none; border-top:none; width:100%; cursor:pointer; text-decoration:none; color:var(--ice); font-family:'Rajdhani',sans-serif; font-weight:600; font-size:14.5px; letter-spacing:0.03em; text-transform:uppercase; }}
+      .admin-row:hover{{ color:var(--ocean-2); }}
+      .admin-row svg{{ width:17px; height:17px; flex-shrink:0; stroke:currentColor; }}
+      .admin-row.danger{{ color:#f87171; }}
+      .admin-row.soon{{ opacity:0.45; }}
+      .admin-section{{ display:none; text-align:left; margin-top:20px; padding-top:16px; border-top:1px solid rgba(56,189,248,0.15); }}
+      .admin-section.show{{ display:block; }}
+      .admin-section h3{{ font-family:'Rajdhani',sans-serif; font-size:14px; letter-spacing:0.1em; text-transform:uppercase; color:rgba(230,246,255,0.6); margin:0 0 12px; }}
+      select.field{{ appearance:none; }}
+    </style>
+    </head><body>
+    {NAV_HTML}
+    <div class="container"><div class="card">
+      <h1>Admin Panel</h1>
+      <div class="subtitle">Xin chào, {ADMIN_USERNAME}</div>
+
+      <div class="admin-list">
+        <a class="admin-row" href="/"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12l9-9 9 9"/><path d="M9 21V12h6v9"/></svg> Trang Chủ</a>
+        <button class="admin-row" onclick="showSection('create')"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 8v8M8 12h8"/></svg> Tạo Khóa Mới</button>
+        <button class="admin-row" onclick="showSection('manage')"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v14c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></svg> Quản Lý Keys</button>
+        <a class="admin-row" href="/tra-cuu-key"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4.5 8-11V5l-8-3-8 3v6c0 6.5 8 11 8 11Z"/></svg> Kiểm Tra Key</a>
+        <button class="admin-row soon" onclick="soon()"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 12v6a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h6"/><path d="M16 2h6v6M22 2l-9 9"/></svg> Key Free</button>
+        <button class="admin-row" onclick="showSection('stats')"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20V10M12 20V4M20 20v-7"/></svg> Thống Kê Key</button>
+        <button class="admin-row soon" onclick="soon()"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 21v-7a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v7"/><path d="M9 21v-4h6v4"/><path d="M9 3h6l1 5H8l1-5Z"/></svg> GetKey Config</button>
+        <button class="admin-row soon" onclick="soon()"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 17l6-6-6-6"/><path d="M12 19h8"/></svg> Web Log</button>
+        <button class="admin-row soon" onclick="soon()"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg> Bảo Mật</button>
+        <button class="admin-row soon" onclick="soon()"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="7" y="2" width="10" height="20" rx="2"/><path d="M11 18h2"/></svg> Duyệt Thiết Bị</button>
+        <button class="admin-row soon" onclick="soon()"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></svg> Check IP</button>
+        <button class="admin-row soon" onclick="soon()"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.9.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.9-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.9V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1Z"/></svg> API Docs</button>
+        <form method="POST" action="/admin/logout" style="margin:0;">
+          <button class="admin-row danger" type="submit" style="border:none;background:none;"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="M16 17l5-5-5-5"/><path d="M21 12H9"/></svg> Đăng Xuất</button>
+        </form>
+      </div>
+
+      <div class="admin-section" id="section-create">
+        <h3>Tạo Khóa Mới</h3>
+        <select class="field" id="createDuration">
+          <option value="12h">12 Giờ</option>
+          <option value="24h">24 Giờ</option>
+          <option value="1d">1 Ngày</option>
+          <option value="3d">3 Ngày</option>
+          <option value="7d">7 Ngày</option>
+          <option value="forever">Vĩnh Viễn</option>
+        </select>
+        <button class="btn-primary" onclick="createKey()">Tạo Key</button>
+        <div id="createMsg" class="msg"></div>
+      </div>
+
+      <div class="admin-section" id="section-manage">
+        <h3>Quản Lý Keys</h3>
+        <div id="stats" class="msg"></div>
+        <div class="table-wrap">
+          <table id="keysTable">
+            <thead><tr><th>Key</th><th>Loại</th><th></th></tr></thead>
+            <tbody id="keysBody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="admin-section" id="section-stats">
+        <h3>Thống Kê Key</h3>
+        <div id="statsOnly" class="msg"></div>
+      </div>
+    </div></div>
+    <script>
+      function showSection(name){{
+        document.querySelectorAll('.admin-section').forEach(function(el){{ el.classList.remove('show'); }});
+        var target = document.getElementById('section-' + name);
+        if(target){{ target.classList.add('show'); target.scrollIntoView({{behavior:'smooth', block:'start'}}); }}
+        if(name === 'manage'){{ loadKeys(); loadStats(); }}
+        if(name === 'stats'){{ loadStatsOnly(); }}
+      }}
+      function soon(){{ alert('Tính năng này đang được phát triển, sẽ sớm ra mắt.'); }}
+      async function loadStats(){{
+        var res = await fetch('/api/admin/today-count'); var d = await res.json();
+        document.getElementById('stats').innerHTML = 'Đã tạo hôm nay: <b>' + d.count + ' / ' + d.limit + '</b>';
+      }}
+      async function loadStatsOnly(){{
+        var res = await fetch('/api/admin/today-count'); var d = await res.json();
+        document.getElementById('statsOnly').innerHTML = 'Đã tạo hôm nay: <b>' + d.count + ' / ' + d.limit + '</b>';
+      }}
+      async function loadKeys(){{
+        var res = await fetch('/api/admin/keys');
+        if(res.status===401){{ window.location.href='/admin/login'; return; }}
+        var keys = await res.json();
+        var body = document.getElementById('keysBody'); body.innerHTML='';
+        keys.slice().reverse().forEach(function(k){{
+          var tr = document.createElement('tr');
+          tr.innerHTML = '<td>'+k.code+'</td><td>'+k.duration+'</td><td><button class="del-btn" onclick="delKey('+k.id+')">Xóa</button></td>';
+          body.appendChild(tr);
+        }});
+      }}
+      async function delKey(id){{
+        if(!confirm('Xóa key này?')) return;
+        await fetch('/api/admin/delete/'+id, {{method:'DELETE'}});
+        loadKeys();
+      }}
+      async function createKey(){{
+        var duration = document.getElementById('createDuration').value;
+        var msg = document.getElementById('createMsg');
+        msg.className = 'msg'; msg.textContent = 'Đang tạo...';
+        try{{
+          var res = await fetch('/api/admin/create', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{duration: duration}})}});
+          var data = await res.json();
+          if(data.error){{ msg.className='msg msg-err'; msg.textContent = data.error; return; }}
+          msg.className = 'msg msg-ok'; msg.textContent = 'Đã tạo: ' + data.code;
+        }}catch(e){{ msg.className='msg msg-err'; msg.textContent = 'Lỗi kết nối.'; }}
+      }}
+    </script>
+    </body></html>'''
+
+
+# ---- Chạy server ----
+if __name__ == "__main__":
+    if not os.path.exists(KEY_FILE):
+        save_keys([])
+    port = int(os.environ.get("PORT", 5005))
+    debug_mode = os.environ.get("FLASK_DEBUG", "0") == "1"
+    app.run(host="0.0.0.0", port=port, debug=debug_mode)
